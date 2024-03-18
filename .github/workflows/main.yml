@@ -1,0 +1,186 @@
+name: CI Workflow
+
+concurrency: 
+  group: ci-workflow-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: 
+    - main
+    paths-ignore:
+    - 'docs/**'
+    - '*.md'
+    - .github/workflows/*.yml
+    - .env*
+
+  workflow_dispatch:
+
+env:
+  FASTLANE_XCODE_LIST_TIMEOUT: 120
+  FASTLANE_XCODEBUILD_SETTINGS_TIMEOUT: 120
+  DERIVED_DATA_PATH: ".workdir/DerivedData"
+  BUNDLE_DIR: ".workdir/bundle"
+  ASSETS_DIR: ".workdir/assets"
+  
+jobs:
+  analyze:
+    name: Analyze
+    uses: auchan-retail-international/ari-client-digital-smi-core-app-ios/.github/workflows/analyze.yml@main
+    secrets: inherit
+
+  prepare:
+    name: Prepare
+    runs-on: [self-hosted, linux, X64]
+    outputs:
+      artifact-name: ${{ steps.upload-design-assets.outputs.artifact-name }}
+      asset-paths: ${{ steps.upload-design-assets.outputs.paths }}
+    env:
+      DESIGN_SYSTEM_PACKAGE_NAME: "@ari/nest-foundations-web-textstyles"
+    steps:
+        
+    - name: Extract branch name
+      id: extract_branch
+      shell: bash
+      run: |
+        echo "branch=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}" >> $GITHUB_OUTPUT
+        
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ steps.extract_branch.outputs.branch }}
+
+    - name: Upload Design System Assets
+      id: upload-design-assets
+      uses: ./.github/actions/upload-design-system-assets
+      env:
+        REGISTRY_TOKEN: ${{ secrets.NEXUS_REGISTRY_TOKEN }}
+      with:
+        package-name: ${{ env.DESIGN_SYSTEM_PACKAGE_NAME }}
+        registry-token: ${{ env.REGISTRY_TOKEN }}
+        path: |
+          node_modules/${{ env.DESIGN_SYSTEM_PACKAGE_NAME }}/dist/json/textstyles.json
+
+
+  build: 
+    name: Build
+    needs: [analyze, prepare]
+    runs-on: macos-14
+    outputs:
+      component-name: ${{ steps.set-custom-outputs.outputs.component-name }} 
+      prerelease-tag-version: ${{ steps.build-prerelease.outputs.prerelease-tag-version }} 
+    env:
+      DS_ARTIFACT_NAME: ${{ needs.prepare.outputs.artifact-name }}
+      DS_ASSET_PATHS:   ${{ needs.prepare.outputs.asset-paths }}
+      APPSTORE_API_KEY_CONTENT: ${{ secrets.APPSTORE_API_KEY_CONTENT }}
+      GIT_SSH_COMMAND: "ssh -o StrictHostKeyChecking=no"
+      MATCH_READONLY: true
+      MATCH_GIT_PRIVATE_KEY: ${{ secrets.MATCH_GIT_PRIVATE_KEY }}
+      MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+      FASTLANE_PASSWORD: ${{ secrets.FASTLANE_PASSWORD }}
+    steps:
+        
+    - name: Checkout
+      uses: actions/checkout@v4
+      
+    - name: Configure fastlane it user
+      run: |
+        git config user.name github-actions
+        git config user.email github-actions@github.com
+      
+    - name: Setup build environment
+      run: |
+        echo "Select Xcode version"
+        sudo xcode-select -s /Applications/Xcode_15.0.1.app
+      
+    - name: Set custom outputs
+      id: set-custom-outputs
+      run: |
+        xcode_project_filename=$(ls | grep xcodeproj)
+        app_name=${xcode_project_filename%%.*}
+        
+        echo "component-name=$app_name" >> $GITHUB_OUTPUT
+
+    - uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: '3.0'
+        bundler-cache: true
+
+    - name: Install Fastlane dependencies
+      run: |
+        echo "Installing Fastlane plugins ..."
+        bundle exec fastlane install_plugins
+
+    - name: Trying fetching SPM packages from cache
+      uses: actions/cache@v3
+      with:
+        path: .workdir/DerivedData
+        key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
+        restore-keys: |
+          ${{ runner.os }}-spm-
+
+    - name: Download Artifact
+      uses: actions/download-artifact@v3
+      with:
+        name: ${{ env.DS_ARTIFACT_NAME }}
+        path: ${{ env.ASSETS_DIR }}
+
+    - name: Create APP and commit changes as a prerelease
+      id: build-prerelease
+      env:
+        COMPONENT_NAME: ${{ steps.set-custom-outputs.outputs.component-name }}
+        DESIGN_SYSTEM_ASSETS_DIR: ${{ env.ASSETS_DIR }}
+      run: |
+        echo "::notice title=Design System Assets::$(ls -alh '${{ env.DESIGN_SYSTEM_ASSETS_DIR }}')"
+        eval "$(ssh-agent -s)"
+        ssh-add - <<< "${MATCH_GIT_PRIVATE_KEY}"
+        bundle exec fastlane ios prerelease app_name:"${{ env.COMPONENT_NAME }}"
+
+        prerelease_tag="$(git describe)"
+        echo "::notice title=Pre-release tag::${prerelease_tag}"
+        echo "prerelease-tag-version=$prerelease_tag" >> $GITHUB_OUTPUT
+
+    - name: Archive artifact
+      env:
+        COMPONENT_NAME: ${{ steps.set-custom-outputs.outputs.component-name }}
+        ARCHIVE_NAME: ${{ steps.set-custom-outputs.outputs.component-name }}.app.tgz
+        ARTIFACT_BASE_DIR: "${{ env.DERIVED_DATA_PATH }}/Build/Products/Debug-iphoneos"
+
+      run: |
+        mkdir -pv "${{ env.BUNDLE_DIR }}/"
+        echo "Archiving to "${{ env.BUNDLE_DIR }}""
+        tar czfv "${{ env.BUNDLE_DIR }}/${{ env.ARCHIVE_NAME }}" --directory  "${{ env.ARTIFACT_BASE_DIR }}" "${{ env.COMPONENT_NAME }}.app" 
+        echo "Done."
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v3
+      env:
+        ARCHIVE_NAME: ${{ steps.set-custom-outputs.outputs.component-name }}.app.tgz
+        COMPONENT_NAME: ${{ steps.set-custom-outputs.outputs.component-name }}
+        PRERELEASE_TAG_VERSION: ${{ steps.build-prerelease.outputs.prerelease-tag-version }}
+      with:
+        name: "${{ env.COMPONENT_NAME }}-${{ env.PRERELEASE_TAG_VERSION }}"
+        path: "${{ env.BUNDLE_DIR }}/${{ env.ARCHIVE_NAME  }}"
+        retention-days: 1
+
+
+  deliver:
+    name: Deliver
+    needs: [build]
+    runs-on: ubuntu-latest
+    env:
+      COMPONENT_NAME: ${{ needs.build.outputs.component-name }} 
+      ARCHIVE_NAME: ${{ needs.build.outputs.component-name }}.app.tgz
+      PRERELEASE_TAG_VERSION: ${{ needs.build.outputs.prerelease-tag-version }} 
+    steps:
+    - name: Download Artifact
+      uses: actions/download-artifact@v3
+      with:
+        name: "${{ env.COMPONENT_NAME }}-${{ env.PRERELEASE_TAG_VERSION }}"
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with: 
+        tag_name: "${{ env.PRERELEASE_TAG_VERSION }}"
+        prerelease: true
+        files: |
+          ./${{ env.ARCHIVE_NAME }}
